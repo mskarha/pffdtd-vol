@@ -42,6 +42,7 @@
 #ifndef _OMP_H
 #include <omp.h>
 #endif
+#include "vol_export.h"
 #ifdef __linux__
 #include <unistd.h> // for sysconf
 #endif
@@ -732,6 +733,12 @@ double run_sim(const struct SimData *sd)
    int64_t Nx_pos=0;
    //uint64_t Nx_pos2=0;
 
+   //per-device tracking for the volumetric snapshot gather (interior x-slab origin)
+   int64_t *vol_Nx_pos_per_gid = NULL;
+   if (sd->vol_export_enabled) {
+      mymalloc((void **)&vol_Nx_pos_per_gid, (size_t)ngpus*sizeof(int64_t));
+   }
+
    Real *u_out_buf; 
    gpuErrchk( cudaMallocHost(&u_out_buf, (size_t)(sd->Nr*sizeof(Real))) );
    memset(u_out_buf, 0, (size_t)(sd->Nr*sizeof(Real))); //set floats to zero
@@ -887,6 +894,9 @@ double run_sim(const struct SimData *sd)
 
       gpuErrchk( cudaMalloc(&(gd->bn_mask), (size_t)(ghd->Nbm*sizeof(uint8_t))) );    
       gpuErrchk( cudaMemcpy(gd->bn_mask, ghd->bn_mask, (size_t)ghd->Nbm*sizeof(uint8_t), cudaMemcpyHostToDevice) );
+
+      //record this device's global interior-X starting row BEFORE bumping Nx_read
+      if (sd->vol_export_enabled) vol_Nx_pos_per_gid[gid] = Nx_read;
 
       Ns_read += ghd->Ns;
       Nr_read += ghd->Nr;
@@ -1086,6 +1096,23 @@ double run_sim(const struct SimData *sd)
    gpuErrchk( cudaEventCreate(&cuEv_main_sample_start) );
    gpuErrchk( cudaEventCreate(&cuEv_main_sample_end) );
 
+   //--- Volumetric VTKHDF ImageData snapshot writer (optional) ---
+   VolExporter vx;
+   memset(&vx, 0, sizeof(vx));
+   if (sd->vol_export_enabled) {
+      vol_exporter_open(
+         &vx,
+         sd->vol_path,
+         sd->fcc_flag,
+         sd->Nx, sd->Ny, sd->Nz,
+         sd->vol_origin_x, sd->vol_origin_y, sd->vol_origin_z,
+         sd->h,
+         sd->vol_snapshot_stride,
+         sd->vol_gzip_level,
+         sd->infac /* rescale to physical units, matches rescale_output() */
+      );
+   }
+
    for (int64_t n=0; n<sd->Nt; n++) { //loop over time-steps
       for (int gid=0; gid < ngpus; gid++) { //loop over GPUs (one thread launches all kernels)
          gpuErrchk( cudaSetDevice(gid) );
@@ -1240,6 +1267,63 @@ double run_sim(const struct SimData *sd)
          }
       }
 
+      // -----------------------------------------------------------------------
+      // Volumetric VTKHDF ImageData snapshot
+      // After the pointer swap, gd->u1 holds the freshly-computed pressure for
+      // time-step index n.  In single precision we cast on the device to host
+      // float; in double we copy to a temporary host double slab and downcast.
+      // For multi-GPU we gather the interior x-slab of each device in turn.
+      // -----------------------------------------------------------------------
+      if (sd->vol_export_enabled && (n % sd->vol_snapshot_stride == 0)) {
+         for (int gid=0; gid < ngpus; gid++) {
+            gpuErrchk( cudaSetDevice(gid) );
+            struct gpuData     *gd  = &(gds[gid]);
+            struct gpuHostData *ghd = &(ghds[gid]);
+
+            // interior rows on this device: skip 1 halo at the start (gid>0)
+            // and 1 at the end (gid<ngpus-1).  Each row is Nzy floats.
+            int64_t src_row_off    = (gid>0)        ? 1     : 0;          // rows
+            int64_t n_interior_row = ghd->Nx;                              // rows = ghd->Nxh - halos
+            int64_t dst_off_floats = vol_Nx_pos_per_gid[gid] * Nzy;        // floats
+            int64_t src_off_floats = src_row_off * Nzy;                    // floats
+            size_t  bytes          = (size_t)n_interior_row * (size_t)Nzy * sizeof(Real);
+
+            if (sizeof(Real) == sizeof(float)) {
+               // Single precision: D2H direct into the float gather buffer
+               gpuErrchk( cudaMemcpyAsync(
+                  vx.gather_buf + dst_off_floats,
+                  gd->u1        + src_off_floats,
+                  bytes,
+                  cudaMemcpyDeviceToHost,
+                  gd->cuStream_bn) );
+            } else {
+               // Double precision: D2H to a per-gid double slab, then downcast.
+               // (Allocate per call -- snapshots are infrequent; double precision
+               //  runs are uncommon and small).
+               double *tmp_d = NULL;
+               mymalloc((void **)&tmp_d, bytes);
+               gpuErrchk( cudaMemcpy(
+                  tmp_d,
+                  gd->u1 + src_off_floats,
+                  bytes,
+                  cudaMemcpyDeviceToHost) );
+               int64_t Nfloats = (int64_t)n_interior_row * Nzy;
+               #pragma omp parallel for schedule(static)
+               for (int64_t i = 0; i < Nfloats; i++) {
+                  vx.gather_buf[dst_off_floats + i] = (float)tmp_d[i];
+               }
+               free(tmp_d);
+            }
+         }
+         // wait for all device gathers to finish before host-side unfold/write
+         for (int gid=0; gid < ngpus; gid++) {
+            gpuErrchk( cudaSetDevice(gid) );
+            struct gpuData *gd = &(gds[gid]);
+            gpuErrchk( cudaStreamSynchronize(gd->cuStream_bn) );
+         }
+         vol_exporter_append(&vx, (float)((double)n * sd->Ts));
+      }
+
       {
          //timing only on gpu0
          gpuErrchk( cudaSetDevice(0) );
@@ -1335,6 +1419,13 @@ double run_sim(const struct SimData *sd)
       free(ghd->out_ixyz);
    }
    gpuErrchk( cudaFreeHost(u_out_buf) );
+
+   // Close volumetric snapshot writer (no-op if not enabled)
+   if (sd->vol_export_enabled) {
+      vol_exporter_close(&vx);
+      free(vol_Nx_pos_per_gid);
+   }
+
    free(gds);
    free(ghds);
 

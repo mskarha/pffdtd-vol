@@ -6,9 +6,10 @@
 #
 # Copyright 2021 Brian Hamilton.
 #
-# File name: test_script_MV_fcc_viz.py
+# File name: test_script_martindiffusion_fcc_gpu.py
 #
-# Description: this shows a simple setup with FCC scheme, for a larger single-precision GPU run (<12GB VRAM)
+# Description: FCC + GPU run with full volumetric VTKHDF ImageData export
+#              (for ParaView FlyingEdges3D / contour / volume rendering).
 #
 ##############################################################################
 from sim_setup import sim_setup
@@ -32,13 +33,17 @@ sim_setup(
     save_folder='../data/sim_data/martindiffusion/gpu',
     save_folder_gpu='../data/sim_data/martindiffusion/gpu',
     compress=3, #apply level-3 GZIP compression to larger h5 files
-    use_receiver_grid=True, #generate 3D grid of receivers for visualization
-    receiver_grid_spacing=0.1, #receiver grid spacing in meters (0.2m gives ~10k receivers, 0.1m gives ~500k - too many!)
-    receiver_grid_boundary_margin=0.01, #minimum distance from boundaries in meters (default: 0.1m)
+    # --- volumetric VTKHDF ImageData export (read by C/CUDA engine) ---
+    vol_export=True,
+    vol_snapshot_dt=0.0005,   #0.5 ms between snapshots
+    vol_gzip_level=3,
+    use_receiver_grid=False,
 )
 
-#then from '../data/sim_data/martindiffusion/gpu' folder, run (relative path for default folder structure):
+#then from '../data/sim_data/martindiffusion/gpu' folder, run:
 #   ../../../../c_cuda/fdtd_main_gpu_single.x
-
-#then post-process with something like:
+#
+#The engine writes `vol_pressure.vtkhdf` into that folder.  Open in ParaView 5.12+.
+#
+#WAV/IR post-processing (only needed if use_receiver_grid=True):
 #   python -m fdtd.process_outputs --data_dir='../data/sim_data/martindiffusion/gpu/' --fcut_lowpass 2500.0 --N_order_lowpass=8 --symmetric --fcut_lowcut 10.0 --N_order_lowcut=4 --air_abs_filter='stokes' --save_wav --plot

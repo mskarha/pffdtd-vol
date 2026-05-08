@@ -17,7 +17,10 @@ from numpy import array as npa
 import h5py
 from pathlib import Path
 class SimConsts:
-    def __init__(self,Tc,rh,h=None,SR=None,fmax=None,PPW=None,fcc=False):
+    def __init__(self,Tc,rh,h=None,SR=None,fmax=None,PPW=None,fcc=False,
+                 vol_export_enabled=False,
+                 vol_snapshot_stride=1,
+                 vol_gzip_level=3):
         #Tc is temperature, rh is relative humidity <- this gives c (speed of sound)
         assert Tc >= -20
         assert Tc <= 50
@@ -70,6 +73,11 @@ class SimConsts:
         self.Tc = Tc
         self.rh = rh
 
+        # VTKHDF ImageData volumetric-snapshot config (read by the C engine)
+        self.vol_export_enabled  = bool(vol_export_enabled)
+        self.vol_snapshot_stride = int(max(1, vol_snapshot_stride))
+        self.vol_gzip_level      = int(min(9, max(0, vol_gzip_level)))
+
     def print(self,fstring):
         print(f'--CONSTS: {fstring}')
 
@@ -102,5 +110,12 @@ class SimConsts:
         h5f.create_dataset('fcc_flag', data=np.int8(fcc))
         h5f.create_dataset('Tc', data=np.float64(Tc))
         h5f.create_dataset('rh', data=np.float64(rh))
+
+        # Volumetric VTKHDF snapshot config (read optionally by the C engine).
+        # Always write so that re-runs see the current setting; older binaries
+        # that don't know these keys simply ignore them.
+        h5f.create_dataset('vol_export_enabled',  data=np.int8(self.vol_export_enabled))
+        h5f.create_dataset('vol_snapshot_stride', data=np.int64(self.vol_snapshot_stride))
+        h5f.create_dataset('vol_gzip_level',      data=np.int64(self.vol_gzip_level))
 
         h5f.close()

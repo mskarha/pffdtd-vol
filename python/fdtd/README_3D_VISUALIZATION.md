@@ -1,8 +1,154 @@
 # 3D Wave Propagation Visualization Guide
 
-This guide explains how to set up 3D grid-based receivers and export to VTKHDF format for ParaView visualization.
+There are now **two** ways to get a wave-propagation animation into ParaView,
+and you almost certainly want path **A**:
 
-## Overview
+| Path | Format | Captures |  Filters available | When to use |
+| ---  | ---    | ---     |       ---          |    ---      |
+| **A. Volumetric snapshot** (RECOMMENDED) | VTKHDF `ImageData` | The full pressure field at every grid point | FlyingEdges3D, Contour, Slice, Volume Rendering, Threshold | Smooth continuous visualization, isosurfaces |
+| B. Receiver-grid (legacy) | VTKHDF `UnstructuredGrid` (vertex cells) | Sparse subset of points where you placed receivers | Glyph, Threshold | When you also want WAV/IR per-point output |
+
+---
+
+## Path A — Volumetric snapshot export (recommended)
+
+The C/CUDA engine writes the **entire pressure field as a dense Cartesian
+`vtkImageData` time series** during the simulation, in a single `.vtkhdf`
+file.  This is the right input for FlyingEdges3D, Contour, Volume rendering,
+and any other filter that needs a dense scalar volume.
+
+The FCC fold/checkerboard packing is undone on every snapshot
+(unfold + 12-neighbour densify on the host) so the file you get out is a
+straightforward Cartesian volume of shape `(Nx, Nyf, Nz)` at the simulation's
+own grid spacing `h`.
+
+### Setup
+
+In your `sim_setup(...)` call add the new keywords:
+
+```python
+sim_setup(
+    # ... your usual args ...
+    fcc_flag=True,
+    save_folder='../data/sim_data/person/gpu',
+    save_folder_gpu='../data/sim_data/person/gpu',
+
+    # Volumetric VTKHDF ImageData export
+    vol_export=True,
+    vol_snapshot_dt=0.0005,   # write a snapshot every 0.5 ms wall-clock
+                              # (alternatively pass vol_snapshot_stride=N steps)
+    vol_gzip_level=3,         # 0 to disable, 3 is a good default
+)
+```
+
+This adds three small scalars to `sim_consts.h5`:
+
+| Key | Type | Meaning |
+| --- | ---  | ---     |
+| `vol_export_enabled` | int8  | 1 to enable |
+| `vol_snapshot_stride` | int64 | snapshot every N FDTD steps (>=1) |
+| `vol_gzip_level`     | int64 | GZIP level 0..9 for the per-step `Pressure` dataset |
+
+These are read by the C engine on startup; the Python engine ignores them.
+
+### Run
+
+Same as before:
+
+```bash
+cd ../data/sim_data/person/gpu
+../../../../c_cuda/fdtd_main_gpu_single.x
+```
+
+The engine writes `vol_pressure.vtkhdf` into the run directory.  Override the
+filename or path with environment variables if needed:
+
+```bash
+PFFDTD_VOL_PATH=/some/elsewhere/run42.vtkhdf  ../../../../c_cuda/fdtd_main_gpu_single.x
+PFFDTD_VOL_STRIDE=20                          ../../../../c_cuda/fdtd_main_gpu_single.x   # override stride
+PFFDTD_VOL_EXPORT=1                           ../../../../c_cuda/fdtd_main_gpu_single.x   # force-enable
+```
+
+### File-size sanity
+
+`sim_setup` prints an estimate before voxelisation, e.g.:
+
+```
+--SIM_SETUP: vol_export ENABLED  stride=12  effective dt=0.500 ms (~2000.0 fps)  gzip=3
+--SIM_SETUP: vol_export size estimate: 220.4 MB/snap (raw), ~20 snaps, ~2.15 GB total
+```
+
+If the total looks too big, raise `vol_snapshot_dt` (or `vol_snapshot_stride`)
+and re-run `sim_setup`.
+
+### Coordinate system
+
+The writer sets `Origin = (xv[0], yv[0], zv[0])`, `Spacing = (h, h, h)` and a
+permutation `Direction` matrix so the volume sits in the **true physical
+(X, Y, Z) world coordinates of the room**.  No transpose, no axis swap --
+the volume overlays directly with the original geometry mesh in ParaView.
+
+### Open in ParaView
+
+ParaView 5.12+ (VTK 9.3+) is required.
+
+1. **File → Open** → select `vol_pressure.vtkhdf`
+2. The dataset shows up as `ImageData` with a populated time slider
+3. Apply your preferred filter:
+   - **Volume rendering**: representation → "Volume", set up a transfer function
+   - **Contour / FlyingEdges3D**: gives clean smooth isosurfaces of pressure
+   - **Slice**: arbitrary cross-section planes
+   - **Clip**: hide everything above a threshold for a half-volume look
+4. Use the time slider to scrub or play the animation
+
+### How FCC is handled
+
+When `fcc_flag=True` the GPU engine uses the folded FCC layout described in
+`gpu_engine.h`:
+
+- Storage shape `(Nx, Ny_storage, Nz)` where `Ny_storage = Nyf/2 + 1`
+- Logical "active" sites: `(ix + iy_logical + iz) % 2 == 0` on a Cartesian
+  lattice of shape `(Nx, Nyf, Nz)` at spacing `h`
+
+For each snapshot, `vol_export.h` does:
+
+1. **Gather** every device's interior x-slab D2H into a host buffer of shape
+   `(Nx, Ny_storage, Nz)`
+2. **Unfold** by parity: storage cell `(ix, iy, iz)` lands at logical
+   `(ix, iy, iz)` if `(ix+iy+iz) % 2 == 0`, else at `(ix, Nyf-1-iy, iz)`
+3. **Densify** the inactive half-lattice by averaging the 12 nearest FCC
+   neighbours -- the same stencil the air kernel uses.  Equivalent to a
+   half-step Cartesian interpolation; perfectly fine for visualization.
+4. Append to the `Pressure` dataset in the open VTKHDF writer
+
+For Cartesian (`fcc_flag=False`) only the gather is needed; the buffer is
+written directly.
+
+### Pulling the file off EC2
+
+```bash
+# in the container on EC2
+docker compose exec pffdtd bash -lc \
+  'cp /src/pffdtd/data/sim_data/person/gpu/vol_pressure.vtkhdf /host-data/'
+
+# locally on WSL
+scp -i ~/.ssh/galaxy2-pem.pem \
+  ubuntu@<your-ec2-host>:/home/ubuntu/pffdtd-outputs/vol_pressure.vtkhdf \
+  /mnt/c/Users/Matt_S/Downloads/vol_pressure.vtkhdf
+```
+
+---
+
+## Path B — Receiver-grid export (legacy)
+
+This is the old workflow.  It produces a `vtkUnstructuredGrid` of vertex
+cells -- ParaView can render those as point glyphs but **FlyingEdges3D and
+contour will not work** because there are no real cells with volume.
+
+This path remains useful if you want WAV/IR outputs at a sparse grid of
+receiver positions in addition to (or instead of) volumetric snapshots.
+
+### Overview
 
 The workflow consists of:
 1. **Grid Generation**: Generate a 3D grid of receivers matching simulation grid spacing

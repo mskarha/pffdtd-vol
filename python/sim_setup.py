@@ -58,6 +58,11 @@ def sim_setup(
                 use_receiver_grid=False, #generate 3D grid of receivers instead of using JSON receivers
                 receiver_grid_spacing=0.1, #receiver grid spacing in meters (default: 0.1m)
                 receiver_grid_boundary_margin=0.1, #minimum distance from boundaries in meters (default: 0.1m)
+                #--- volumetric VTKHDF ImageData snapshot export (read by C engine) ---
+                vol_export=False, #write the full pressure field as a VTKHDF ImageData time series (for ParaView)
+                vol_snapshot_stride=None, #write a snapshot every N FDTD time steps (>=1); takes precedence over vol_snapshot_dt
+                vol_snapshot_dt=None, #target wall-clock interval between snapshots in seconds (computes stride from Ts)
+                vol_gzip_level=3, #GZIP level 0..9 for per-step Pressure (3 is a good default)
               ):
     assert Tc is not None
     assert rh is not None
@@ -95,6 +100,24 @@ def sim_setup(
 
     #some constants for the simulation, in one place
     sim_consts = SimConsts(Tc=Tc,rh=rh,fmax=fmax,PPW=PPW,fcc=fcc_flag)
+
+    # Resolve volumetric snapshot stride (steps) from either explicit stride or wall-clock dt
+    if vol_export:
+        if vol_snapshot_stride is None and vol_snapshot_dt is None:
+            vol_snapshot_stride_resolved = 1
+        elif vol_snapshot_stride is not None:
+            vol_snapshot_stride_resolved = int(max(1, vol_snapshot_stride))
+        else:
+            vol_snapshot_stride_resolved = int(max(1, round(vol_snapshot_dt / sim_consts.Ts)))
+        sim_consts.vol_export_enabled  = True
+        sim_consts.vol_snapshot_stride = vol_snapshot_stride_resolved
+        sim_consts.vol_gzip_level      = int(min(9, max(0, vol_gzip_level)))
+        eff_dt = sim_consts.vol_snapshot_stride * sim_consts.Ts
+        eff_fps = 1.0 / eff_dt
+        print(f'--SIM_SETUP: vol_export ENABLED  stride={sim_consts.vol_snapshot_stride}  '
+              f'effective dt={eff_dt*1000:.3f} ms (~{eff_fps:.1f} fps)  '
+              f'gzip={sim_consts.vol_gzip_level}')
+
     sim_consts.save(save_folder)
 
     #link up the wall materials to impedance datasets
@@ -105,6 +128,24 @@ def sim_setup(
     cart_grid = CartGrid(h=sim_consts.h,offset=3.5,bmin=room_geo.bmin,bmax=room_geo.bmax,fcc=fcc_flag)
     cart_grid.print_stats()
     cart_grid.save(save_folder)
+
+    # Estimate VTKHDF volumetric output size if enabled (helpful sanity check)
+    if vol_export:
+        Nx, Ny, Nz = int(cart_grid.Nx), int(cart_grid.Ny), int(cart_grid.Nz)
+        # FCC fold halves the storage Y but the unfolded ImageData uses full Ny
+        # (= Nyf), which happens to equal `Ny` here because the fold has not yet
+        # occurred in the Python pipeline -- only after fold_fcc_sim_data().
+        Nyf = Ny
+        Nt_total = int(round(duration / sim_consts.Ts))
+        n_snaps  = max(1, Nt_total // sim_consts.vol_snapshot_stride)
+        per_snap_uncompressed_MB = (Nx * Nyf * Nz * 4) / (1024.0 * 1024.0)
+        # rough compression ratio from SHUFFLE+DEFLATE on smooth pressure fields
+        # is typically ~2-3x, conservative estimate ~2x
+        compress_ratio = 1.0 if sim_consts.vol_gzip_level == 0 else 2.0
+        total_MB = (per_snap_uncompressed_MB / compress_ratio) * n_snaps
+        print(f'--SIM_SETUP: vol_export size estimate: '
+              f'{per_snap_uncompressed_MB:.1f} MB/snap (raw), '
+              f'~{n_snaps} snaps, ~{total_MB/1024.0:.2f} GB total')
 
     #set up the voxel grid (volume hierarchy for ray-triangle intersections)
     vox_grid = VoxGrid(room_geo,cart_grid,Nvox_est=Nvox_est,Nh=Nh)

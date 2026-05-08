@@ -65,6 +65,7 @@ struct SimData {
    int64_t Nba; //number of ABC nodes
    double l; //Courant number (CFL)
    double l2; // CFL number squared
+   double Ts; // sample period (seconds)
    int8_t fcc_flag; //boolean for FCC
    int8_t NN; //integer, neareast neighbours
    int8_t Nm; //number of materials used 
@@ -76,6 +77,16 @@ struct SimData {
    Real lo2; //0.5*l
    Real a2; //update stencil coefficient
    Real a1; //update stencil coefficient
+
+   //--- VTKHDF ImageData volumetric snapshot config (optional) ---
+   int8_t  vol_export_enabled;  //0/1 flag
+   int32_t vol_snapshot_stride; //write a snapshot every N time steps (>=1)
+   int32_t vol_gzip_level;      //GZIP level 0..9 for the per-step Pressure dataset
+   double  h;                   //grid spacing (metres) -- needed for ImageData spacing
+   double  vol_origin_x;        //world coord of voxel (0,0,0): physical X (xv[0])
+   double  vol_origin_y;        //world coord of voxel (0,0,0): physical Y (yv[0])
+   double  vol_origin_z;        //world coord of voxel (0,0,0): physical Z (zv[0])
+   char    vol_path[256];       //output .vtkhdf path (relative to run dir)
 };
 
 //see python code and 2016 ISMRA paper
@@ -89,6 +100,7 @@ struct MatQuad {
 //some declarations (comments at definitions)
 void read_h5_constant(hid_t file, char *dset_str, void *data_container, TYPE t);
 void read_h5_dataset(hid_t file, char *dset_str, int ndims, hsize_t *dims, void **data_array, TYPE t);
+bool read_h5_constant_optional(hid_t file, const char *dset_str, void *data_container, TYPE t);
 void load_sim_data(struct SimData *sd);
 void free_sim_data(struct SimData *sd);
 void read_h5_dataset(hid_t file, char *dset_str, int ndims, hsize_t *dims, void **data_array, TYPE t);
@@ -167,6 +179,22 @@ void load_sim_data(struct SimData *sd) {
    printf("fcc_flag=%d\n",fcc_flag);
    assert((fcc_flag>=0) && (fcc_flag<=2));
    //printf("%s", fcc>0 ? "fcc=true\n" : "fcc=false\n");
+
+   //--- optional volumetric snapshot config (older runs may not have these) ---
+   double h_spacing = 0.0;
+   bool have_h = read_h5_constant_optional(file, "h", (void *)&h_spacing, FLOAT64);
+   if (have_h) printf("h=%.16g\n", h_spacing);
+
+   int8_t  vol_export_enabled    = 0;
+   int64_t vol_snapshot_stride64 = 1;
+   int64_t vol_gzip_level64      = 3;
+   read_h5_constant_optional(file, "vol_export_enabled",  (void *)&vol_export_enabled,    INT8);
+   read_h5_constant_optional(file, "vol_snapshot_stride", (void *)&vol_snapshot_stride64, INT64);
+   read_h5_constant_optional(file, "vol_gzip_level",      (void *)&vol_gzip_level64,      INT64);
+   if (vol_export_enabled) {
+      printf("vol_export_enabled=1, stride=%ld, gzip=%ld\n",
+             (long)vol_snapshot_stride64, (long)vol_gzip_level64);
+   }
 
    if (H5Fclose(file) != 0) {
       printf("error closing file %s",filename);
@@ -282,6 +310,23 @@ void load_sim_data(struct SimData *sd) {
    strcpy(dset_str, "saf_bn");expected_ndims=1;
    read_h5_dataset(file, dset_str, expected_ndims, dims,(void **)&saf_bn,FLOAT64);
    assert((int64_t)dims[0]==Nb);
+
+   //////////////////
+   // xv/yv/zv (only need the first element to recover Origin for VTKHDF export)
+   //////////////////
+   double vol_origin_x = 0.0, vol_origin_y = 0.0, vol_origin_z = 0.0;
+   if (vol_export_enabled) {
+      double *tmp_xv=NULL, *tmp_yv=NULL, *tmp_zv=NULL;
+      hsize_t tmp_dims[2];
+      strcpy(dset_str, "xv"); read_h5_dataset(file, dset_str, 1, tmp_dims, (void **)&tmp_xv, FLOAT64);
+      vol_origin_x = tmp_xv[0]; free(tmp_xv);
+      strcpy(dset_str, "yv"); read_h5_dataset(file, dset_str, 1, tmp_dims, (void **)&tmp_yv, FLOAT64);
+      vol_origin_y = tmp_yv[0]; free(tmp_yv);
+      strcpy(dset_str, "zv"); read_h5_dataset(file, dset_str, 1, tmp_dims, (void **)&tmp_zv, FLOAT64);
+      vol_origin_z = tmp_zv[0]; free(tmp_zv);
+      printf("vol Origin (x,y,z) = (%.6f, %.6f, %.6f) m\n",
+             vol_origin_x, vol_origin_y, vol_origin_z);
+   }
 
    mymalloc((void **)&ssaf_bn, Nb*sizeof(Real));
    for (int64_t i=0; i<Nb; i++) {
@@ -736,6 +781,7 @@ void load_sim_data(struct SimData *sd) {
    sd->Nba  = Nba;
    sd->l    = l;
    sd->l2   = l2;
+   sd->Ts   = Ts;
    sd->fcc_flag  = fcc_flag;
    sd->Nm   = Nm;
    sd->NN   = NN;
@@ -760,6 +806,50 @@ void load_sim_data(struct SimData *sd) {
    sd->u_out     = u_out;
    sd->mat_beta  = mat_beta;
    sd->mat_quads  = mat_quads;
+
+   /*------------------------
+    * VOLUMETRIC SNAPSHOT CONFIG
+   ------------------------*/
+   sd->vol_export_enabled  = vol_export_enabled;
+   sd->vol_snapshot_stride = (int32_t)((vol_snapshot_stride64 > 0) ? vol_snapshot_stride64 : 1);
+   sd->vol_gzip_level      = (int32_t)((vol_gzip_level64 >= 0 && vol_gzip_level64 <= 9) ? vol_gzip_level64 : 3);
+   sd->h                   = h_spacing;
+   sd->vol_origin_x        = vol_origin_x;
+   sd->vol_origin_y        = vol_origin_y;
+   sd->vol_origin_z        = vol_origin_z;
+
+   //default output path; can be overridden via the env variable PFFDTD_VOL_PATH below
+   memset(sd->vol_path, 0, sizeof(sd->vol_path));
+   const char *env_vol_path = getenv("PFFDTD_VOL_PATH");
+   if (env_vol_path != NULL && env_vol_path[0] != '\0') {
+      size_t L = strlen(env_vol_path);
+      if (L >= sizeof(sd->vol_path)) L = sizeof(sd->vol_path) - 1;
+      memcpy(sd->vol_path, env_vol_path, L);
+   } else {
+      strcpy(sd->vol_path, "vol_pressure.vtkhdf");
+   }
+
+   //env override for stride and enable as well (handy for ad-hoc runs)
+   const char *env_stride = getenv("PFFDTD_VOL_STRIDE");
+   if (env_stride != NULL && env_stride[0] != '\0') {
+      int s = atoi(env_stride);
+      if (s > 0) sd->vol_snapshot_stride = s;
+   }
+   const char *env_enable = getenv("PFFDTD_VOL_EXPORT");
+   if (env_enable != NULL && env_enable[0] != '\0') {
+      sd->vol_export_enabled = (int8_t)((env_enable[0] == '1' || env_enable[0] == 't' || env_enable[0] == 'T') ? 1 : 0);
+   }
+
+   if (sd->vol_export_enabled) {
+      if (sd->h <= 0.0) {
+         fprintf(stderr,
+            "WARN: vol_export_enabled but no 'h' in sim_consts.h5; "
+            "VTKHDF spacing will be 1.0 m. Re-run sim_setup with the latest sim_consts.py.\n");
+         sd->h = 1.0;
+      }
+      printf("VOL EXPORT (load): enabled, stride=%d, gzip=%d, path=%s\n",
+             (int)sd->vol_snapshot_stride, (int)sd->vol_gzip_level, sd->vol_path);
+   }
 }
 
 //free everything
@@ -864,6 +954,34 @@ void read_h5_dataset(hid_t file, char *dset_str, int ndims, hsize_t *dims, void 
    else {
       printf("read and closed dataset: %s\n",dset_str);
    }
+}
+
+//read scalar from HDF5 dataset, returning false (without aborting) if the
+//dataset is missing.  Used for backward compatibility with older sim_consts.h5
+//files that don't yet carry the volumetric-snapshot config keys.
+bool read_h5_constant_optional(hid_t file, const char *dset_str, void *data_container, TYPE t) {
+   //temporarily silence the default HDF5 error stack so probe doesn't spam
+   H5E_auto2_t old_func; void *old_data;
+   H5Eget_auto(H5E_DEFAULT, &old_func, &old_data);
+   H5Eset_auto(H5E_DEFAULT, NULL, NULL);
+   htri_t exists = H5Lexists(file, dset_str, H5P_DEFAULT);
+   H5Eset_auto(H5E_DEFAULT, old_func, old_data);
+
+   if (exists <= 0) return false;
+
+   hid_t dset = H5Dopen(file, dset_str, H5P_DEFAULT);
+   if (dset < 0) return false;
+   herr_t status = -1;
+   switch (t) {
+      case FLOAT64: status = H5Dread(dset, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, data_container); break;
+      case FLOAT32: status = H5Dread(dset, H5T_NATIVE_FLOAT,  H5S_ALL, H5S_ALL, H5P_DEFAULT, data_container); break;
+      case INT64:   status = H5Dread(dset, H5T_NATIVE_INT64,  H5S_ALL, H5S_ALL, H5P_DEFAULT, data_container); break;
+      case INT8:    status = H5Dread(dset, H5T_NATIVE_INT8,   H5S_ALL, H5S_ALL, H5P_DEFAULT, data_container); break;
+      case BOOL:    status = H5Dread(dset, H5T_NATIVE_INT8,   H5S_ALL, H5S_ALL, H5P_DEFAULT, data_container); break;
+      default: H5Dclose(dset); return false;
+   }
+   H5Dclose(dset);
+   return (status >= 0);
 }
 
 //read scalars from HDF5 datasets

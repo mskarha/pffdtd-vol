@@ -6,9 +6,15 @@
 #
 # Copyright 2021 Brian Hamilton.
 #
-# File name: test_script_MV_fcc_viz.py
+# File name: test_script_person_fcc_gpu.py
 #
-# Description: this shows a simple setup with FCC scheme, for a larger single-precision GPU run (<12GB VRAM)
+# Description: FCC + GPU run with full volumetric VTKHDF ImageData export
+#              (for ParaView FlyingEdges3D / contour / volume rendering).
+#
+#              The C/CUDA engine writes the entire pressure field as a
+#              dense Cartesian VTKHDF time series during the simulation.
+#              FCC fold/checkerboard handling happens transparently
+#              (unfold + 12-neighbour densify on each snapshot).
 #
 ##############################################################################
 from sim_setup import sim_setup
@@ -32,13 +38,25 @@ sim_setup(
     save_folder='../data/sim_data/person/gpu',
     save_folder_gpu='../data/sim_data/person/gpu',
     compress=3, #apply level-3 GZIP compression to larger h5 files
-    use_receiver_grid=True, #generate 3D grid of receivers for visualization
-    receiver_grid_spacing=0.05, #receiver grid spacing in meters (0.2m gives ~10k receivers, 0.1m gives ~500k - too many!)
-    receiver_grid_boundary_margin=0.01, #minimum distance from boundaries in meters (default: 0.1m)
+    # --- volumetric VTKHDF ImageData export (read by C/CUDA engine) ---
+    vol_export=True,
+    vol_snapshot_dt=0.0005,   #0.5 ms between snapshots (~2 kHz frame rate, ~20 frames per 10 ms run)
+    vol_gzip_level=3,
+    # The receiver-grid path below is no longer required for visualization but
+    # is still useful if you want simultaneous WAV/IR export at a few points.
+    # Set to False to skip entirely and run a pure-volume export.
+    use_receiver_grid=False,
 )
 
 #then from '../data/sim_data/person/gpu' folder, run (relative path for default folder structure):
 #   ../../../../c_cuda/fdtd_main_gpu_single.x
+#
+#The engine will write `vol_pressure.vtkhdf` in that same folder.  Override the
+#path with the env variable PFFDTD_VOL_PATH=/some/other.vtkhdf if needed.
+#
+#Open the resulting .vtkhdf in ParaView (5.12+).  ImageData supports
+#FlyingEdges3D, Contour, Slice, Volume rendering, and the time slider is
+#populated automatically from the embedded Steps/Values dataset.
 
-#then post-process with something like:
+#then post-process WAV/IR outputs (only needed if use_receiver_grid=True):
 #   python -m fdtd.process_outputs --data_dir='../data/sim_data/person/gpu/' --fcut_lowpass 2500.0 --N_order_lowpass=8 --symmetric --fcut_lowcut 10.0 --N_order_lowcut=4 --air_abs_filter='stokes' --save_wav --plot
