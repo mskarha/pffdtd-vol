@@ -71,8 +71,7 @@ typedef struct VtkhdfImageWriter {
    hid_t pointData;
 
    hid_t ds_values;
-   hid_t ds_pressure;
-   hid_t ds_pressure_offsets;
+   hid_t ds_pressure;     //4D: (NSteps, nz, ny, nx)
 
    int64_t nsteps;
    int64_t npoints;
@@ -139,6 +138,76 @@ static inline void vtkhdf__append_1d(hid_t dset, hid_t dtype, const void *data, 
    if (memspace < 0) abort();
 
    vtkhdf__herr_ok(H5Dwrite(dset, dtype, memspace, filespace, H5P_DEFAULT, data), "H5Dwrite");
+
+   H5Sclose(memspace);
+   H5Sclose(filespace);
+}
+
+// Create a 4D resizable dataset of shape (0, nz, ny, nx) with maxdims
+// (UNLIMITED, nz, ny, nx).  Chunked at one full snapshot per chunk so a
+// per-step read/write hits exactly one chunk.
+//
+// VTKHDF spec for transient ImageData: PointData/<field> must be 4D with the
+// time axis prepended.  ParaView's vtkHDFReader rejects 1D-with-offsets
+// layouts for ImageData (those are only valid for UnstructuredGrid /
+// PolyData where per-step sizes can vary).
+static inline hid_t vtkhdf__create_4d_resizable(hid_t parent, const char *name, hid_t dtype,
+                                                hsize_t nz, hsize_t ny, hsize_t nx,
+                                                int gzip_level) {
+   hsize_t dims[4]    = {0,             nz,             ny,             nx};
+   hsize_t maxdims[4] = {H5S_UNLIMITED, nz,             ny,             nx};
+   hid_t space = H5Screate_simple(4, dims, maxdims);
+   if (space < 0) abort();
+
+   hid_t dcpl = H5Pcreate(H5P_DATASET_CREATE);
+   if (dcpl < 0) abort();
+
+   // One snapshot per chunk.  HDF5's hard chunk limit is 4 GB; for our 32-bit
+   // float pressure that's a 1-billion-cell snapshot, comfortably above
+   // typical FDTD grids.
+   hsize_t chunk[4] = {1, nz, ny, nx};
+   vtkhdf__herr_ok(H5Pset_chunk(dcpl, 4, chunk), "H5Pset_chunk");
+
+   if (gzip_level > 0) {
+      // SHUFFLE then GZIP -- big win for spatially-coherent float32 fields
+      vtkhdf__herr_ok(H5Pset_shuffle(dcpl), "H5Pset_shuffle");
+      vtkhdf__herr_ok(H5Pset_deflate(dcpl, (unsigned)gzip_level), "H5Pset_deflate");
+   }
+
+   hid_t dset = H5Dcreate(parent, name, dtype, space, H5P_DEFAULT, dcpl, H5P_DEFAULT);
+   if (dset < 0) abort();
+
+   H5Pclose(dcpl);
+   H5Sclose(space);
+   return dset;
+}
+
+// Extend the first (time) axis of a 4D dataset by one and write one snapshot's
+// worth of values, supplied as a flat buffer of length (nz*ny*nx) in C order
+// (nx fastest).
+static inline void vtkhdf__append_4d_slice_f32(hid_t dset, const float *data,
+                                               hsize_t nz, hsize_t ny, hsize_t nx) {
+   hid_t fspace = H5Dget_space(dset);
+   if (fspace < 0) abort();
+   hsize_t cur_dims[4];
+   H5Sget_simple_extent_dims(fspace, cur_dims, NULL);
+   H5Sclose(fspace);
+
+   hsize_t new_dims[4] = {cur_dims[0] + 1, nz, ny, nx};
+   vtkhdf__herr_ok(H5Dset_extent(dset, new_dims), "H5Dset_extent (4d)");
+
+   hid_t filespace = H5Dget_space(dset);
+   if (filespace < 0) abort();
+   hsize_t start[4] = {cur_dims[0], 0,  0,  0};
+   hsize_t count[4] = {1,           nz, ny, nx};
+   vtkhdf__herr_ok(H5Sselect_hyperslab(filespace, H5S_SELECT_SET, start, NULL, count, NULL),
+                   "H5Sselect_hyperslab (4d)");
+
+   hid_t memspace = H5Screate_simple(4, count, NULL);
+   if (memspace < 0) abort();
+
+   vtkhdf__herr_ok(H5Dwrite(dset, H5T_IEEE_F32LE, memspace, filespace, H5P_DEFAULT, data),
+                   "H5Dwrite (4d)");
 
    H5Sclose(memspace);
    H5Sclose(filespace);
@@ -265,25 +334,24 @@ static inline void vtkhdf_image_writer_open(
    w->pointData = H5Gcreate(w->root, "PointData", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
    if (w->pointData < 0) abort();
 
-   // Pressure: float32, chunked one full snapshot per chunk so reads can map a step in
-   // a single I/O.  Cap chunk size to ~1 GB worth of floats to stay within HDF5 limits.
-   hsize_t chunk0 = (hsize_t)w->npoints;
-   const hsize_t max_chunk_floats = (hsize_t)((1ULL << 30) / sizeof(float)); // 1 GB
-   if (chunk0 > max_chunk_floats) chunk0 = max_chunk_floats;
-   if (chunk0 < 1024) chunk0 = 1024;
-   w->ds_pressure = vtkhdf__create_1d_resizable(w->pointData, "Pressure",
-                                                H5T_IEEE_F32LE, chunk0, gzip_level);
+   // Pressure: float32, 4D = (NSteps, nz, ny, nx).  ParaView's vtkHDFReader
+   // requires 4D for transient ImageData (the 1D + Steps/PointDataOffsets
+   // layout used elsewhere in VTKHDF is only valid for UnstructuredGrid /
+   // PolyData, not for ImageData).
+   w->ds_pressure = vtkhdf__create_4d_resizable(
+      w->pointData, "Pressure", H5T_IEEE_F32LE,
+      (hsize_t)nz, (hsize_t)ny, (hsize_t)nx,
+      gzip_level
+   );
 
-   // Per-field offsets for time-dependent point data live under Steps/PointDataOffsets/<field>
-   hid_t pdo = H5Gcreate(w->steps, "PointDataOffsets", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-   if (pdo < 0) abort();
-   w->ds_pressure_offsets = vtkhdf__create_1d_resizable(pdo, "Pressure",
-                                                        H5T_NATIVE_INT64, 256, 0);
-   H5Gclose(pdo);
+   // No PointDataOffsets group for ImageData -- the 4D layout makes per-step
+   // offsets implicit.
 }
 
 // Append one time step.  pressure_f32 must have exactly npoints (= nx*ny*nz) values
-// in the writer's flat layout (writer-X / nx fastest).
+// in the writer's flat layout (writer-X / nx fastest), interpreted as
+// (nz, ny, nx) C-order when written as a 3D spatial slab into the 4D Pressure
+// dataset at the next time index.
 static inline void vtkhdf_image_writer_append_step_f32(
    VtkhdfImageWriter *w, float time_value, const float *pressure_f32, int64_t npoints
 ) {
@@ -293,17 +361,12 @@ static inline void vtkhdf_image_writer_append_step_f32(
       abort();
    }
 
-   // Record current offset in flattened Pressure dataset BEFORE appending
-   hid_t fspace = H5Dget_space(w->ds_pressure);
-   if (fspace < 0) abort();
-   hsize_t cur_dims[1];
-   H5Sget_simple_extent_dims(fspace, cur_dims, NULL);
-   H5Sclose(fspace);
-   int64_t start = (int64_t)cur_dims[0];
+   vtkhdf__append_1d(w->ds_values, H5T_IEEE_F32LE, &time_value, 1);
 
-   vtkhdf__append_1d(w->ds_values,            H5T_IEEE_F32LE,    &time_value,   1);
-   vtkhdf__append_1d(w->ds_pressure_offsets,  H5T_NATIVE_INT64,  &start,        1);
-   vtkhdf__append_1d(w->ds_pressure,          H5T_IEEE_F32LE,    pressure_f32,  (hsize_t)npoints);
+   vtkhdf__append_4d_slice_f32(
+      w->ds_pressure, pressure_f32,
+      (hsize_t)w->nz, (hsize_t)w->ny, (hsize_t)w->nx
+   );
 
    w->nsteps += 1;
 }
@@ -325,9 +388,8 @@ static inline void vtkhdf_image_writer_close(VtkhdfImageWriter *w) {
       H5Sclose(as);
    }
 
-   if (w->ds_pressure_offsets > 0) H5Dclose(w->ds_pressure_offsets);
-   if (w->ds_pressure         > 0) H5Dclose(w->ds_pressure);
-   if (w->ds_values           > 0) H5Dclose(w->ds_values);
+   if (w->ds_pressure > 0) H5Dclose(w->ds_pressure);
+   if (w->ds_values   > 0) H5Dclose(w->ds_values);
 
    if (w->pointData > 0) H5Gclose(w->pointData);
    if (w->steps     > 0) H5Gclose(w->steps);
