@@ -71,7 +71,9 @@ typedef struct VtkhdfImageWriter {
    hid_t pointData;
 
    hid_t ds_values;
-   hid_t ds_pressure;     //4D: (NSteps, nz, ny, nx)
+   hid_t ds_pressure;             //4D: (NSteps, nz, ny, nx)
+   hid_t ds_pressure_offsets;     //1D: (NSteps,)  -- values [0, 1, 2, ...]
+                                  //                 indexing along the time axis
 
    int64_t nsteps;
    int64_t npoints;
@@ -334,18 +336,30 @@ static inline void vtkhdf_image_writer_open(
    w->pointData = H5Gcreate(w->root, "PointData", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
    if (w->pointData < 0) abort();
 
-   // Pressure: float32, 4D = (NSteps, nz, ny, nx).  ParaView's vtkHDFReader
-   // requires 4D for transient ImageData (the 1D + Steps/PointDataOffsets
-   // layout used elsewhere in VTKHDF is only valid for UnstructuredGrid /
-   // PolyData, not for ImageData).
+   // Pressure: float32, 4D = (NSteps, nz, ny, nx).  Per VTKHDF spec
+   // (https://docs.vtk.org/en/latest/design_documents/VTKFileFormats.html#transient-data),
+   // transient ImageData arrays MUST have time as the prepended first axis.
    w->ds_pressure = vtkhdf__create_4d_resizable(
       w->pointData, "Pressure", H5T_IEEE_F32LE,
       (hsize_t)nz, (hsize_t)ny, (hsize_t)nx,
       gzip_level
    );
 
-   // No PointDataOffsets group for ImageData -- the 4D layout makes per-step
-   // offsets implicit.
+   // Steps/PointDataOffsets/Pressure: 1D length NSteps.  Each entry is the
+   // offset (along axis 0 of the 4D Pressure dataset) where that step's data
+   // begins.  For transient ImageData with one row per step, the values are
+   // [0, 1, 2, ..., NSteps-1].  ParaView's vtkHDFReader requires this
+   // dataset to associate the 4D Pressure with the time axis -- without it
+   // the reader reads invalid data per step and may segfault on time advance.
+   {
+      hid_t pdo = H5Gcreate(w->steps, "PointDataOffsets",
+                            H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+      if (pdo < 0) abort();
+      w->ds_pressure_offsets = vtkhdf__create_1d_resizable(
+         pdo, "Pressure", H5T_NATIVE_INT64, 256, 0
+      );
+      H5Gclose(pdo);
+   }
 }
 
 // Append one time step.  pressure_f32 must have exactly npoints (= nx*ny*nz) values
@@ -362,6 +376,13 @@ static inline void vtkhdf_image_writer_append_step_f32(
    }
 
    vtkhdf__append_1d(w->ds_values, H5T_IEEE_F32LE, &time_value, 1);
+
+   // Record the per-step offset BEFORE writing the slab so the value matches
+   // the index of the slab we're about to append.
+   {
+      int64_t offset = w->nsteps;
+      vtkhdf__append_1d(w->ds_pressure_offsets, H5T_NATIVE_INT64, &offset, 1);
+   }
 
    vtkhdf__append_4d_slice_f32(
       w->ds_pressure, pressure_f32,
@@ -388,8 +409,9 @@ static inline void vtkhdf_image_writer_close(VtkhdfImageWriter *w) {
       H5Sclose(as);
    }
 
-   if (w->ds_pressure > 0) H5Dclose(w->ds_pressure);
-   if (w->ds_values   > 0) H5Dclose(w->ds_values);
+   if (w->ds_pressure_offsets > 0) H5Dclose(w->ds_pressure_offsets);
+   if (w->ds_pressure         > 0) H5Dclose(w->ds_pressure);
+   if (w->ds_values           > 0) H5Dclose(w->ds_values);
 
    if (w->pointData > 0) H5Gclose(w->pointData);
    if (w->steps     > 0) H5Gclose(w->steps);
